@@ -5,6 +5,10 @@ export interface GameSnapshot {
   scoreLeft: number;
   scoreRight: number;
   winner: "left" | "right" | null;
+  /** Rounds the player (left) has left to fire. */
+  playerAmmo: number;
+  /** Rounds the opponent (right) has left to fire. */
+  opponentAmmo: number;
   /** Most recent meaningful event, used to drive screen-reader announcements. */
   announcement: string;
 }
@@ -25,6 +29,40 @@ const SPEED_GAIN = 1.045; // multiplier per paddle hit
 const MAX_SPEED = 980;
 const PLAYER_SPEED = 620; // keyboard paddle speed px/sec
 const AI_SPEED = 430; // px/sec (kept beatable)
+const LASER_SPEED = 1400; // px/sec
+const LASER_W = 26;
+const LASER_H = 5;
+const LASER_COOLDOWN = 0.18; // seconds between shots
+const PADDLE_RESPAWN = 2.5; // seconds a destroyed paddle stays gone
+const MAX_AMMO = 3;
+const AMMO_REGEN = 2; // seconds to regain one round
+const AI_FIRE_INTERVAL = 1.3; // base seconds between opponent shots
+
+const PLAYER_COLOR = "#5ee0c8";
+const OPPONENT_COLOR = "#ff7b9c";
+
+interface Laser {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  dir: -1 | 1; // +1 fired rightward (player), -1 fired leftward (opponent)
+  bounces: number;
+}
+
+const LASER_SPREAD = (5 * Math.PI) / 180; // beams fire within ±5deg of straight
+const LASER_MAX_BOUNCES = 8; // beams expire after this many wall ricochets
+
+interface Particle {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  life: number; // seconds remaining
+  maxLife: number;
+  size: number;
+  color: string;
+}
 
 /**
  * Self-contained Pong simulation + renderer. Owns its own requestAnimationFrame
@@ -60,6 +98,21 @@ export class PongEngine {
   private ballVX = 0;
   private ballVY = 0;
   private spin = 0;
+
+  private lasers: Laser[] = [];
+  private particles: Particle[] = [];
+
+  private leftCooldown = 0;
+  private rightCooldown = 0;
+  private leftAmmo = MAX_AMMO;
+  private rightAmmo = MAX_AMMO;
+  private leftRegen = 0; // seconds accumulated toward the next round
+  private rightRegen = 0;
+  private leftDestroyed = false;
+  private rightDestroyed = false;
+  private leftRespawnIn = 0;
+  private rightRespawnIn = 0;
+  private aiFireIn = AI_FIRE_INTERVAL;
 
   constructor(canvas: HTMLCanvasElement, head: HTMLImageElement, options: PongOptions = {}) {
     const ctx = canvas.getContext("2d");
@@ -101,6 +154,19 @@ export class PongEngine {
     this.scoreRight = 0;
     this.winner = null;
     this.status = "ready";
+    this.lasers = [];
+    this.particles = [];
+    this.leftCooldown = 0;
+    this.rightCooldown = 0;
+    this.leftAmmo = MAX_AMMO;
+    this.rightAmmo = MAX_AMMO;
+    this.leftRegen = 0;
+    this.rightRegen = 0;
+    this.leftDestroyed = false;
+    this.rightDestroyed = false;
+    this.leftRespawnIn = 0;
+    this.rightRespawnIn = 0;
+    this.aiFireIn = AI_FIRE_INTERVAL;
     this.serve(Math.random() < 0.5 ? -1 : 1);
     this.announce("New match. Press space or Start to begin.");
   }
@@ -112,6 +178,45 @@ export class PongEngine {
   setKey(dir: "up" | "down", pressed: boolean): void {
     if (dir === "up") this.keyUp = pressed;
     else this.keyDown = pressed;
+  }
+
+  /** Fire a laser from the player's paddle. Ignored unless the game is live. */
+  firePlayerLaser(): void {
+    this.fire("left");
+  }
+
+  /** Shared firing logic for either side. Gated by status, cooldown, ammo and life. */
+  private fire(side: "left" | "right"): void {
+    if (this.status !== "playing") return;
+    const isLeft = side === "left";
+    if (isLeft ? this.leftDestroyed : this.rightDestroyed) return;
+    if ((isLeft ? this.leftCooldown : this.rightCooldown) > 0) return;
+    if ((isLeft ? this.leftAmmo : this.rightAmmo) <= 0) return;
+
+    const dir: -1 | 1 = isLeft ? 1 : -1;
+    const muzzleX = isLeft ? PADDLE_MARGIN + PADDLE_W : WIDTH - PADDLE_MARGIN - PADDLE_W;
+    const muzzleY = (isLeft ? this.leftY : this.rightY) + PADDLE_H / 2;
+
+    // Fire roughly straight, with a small random ±5deg spread.
+    const angle = (Math.random() * 2 - 1) * LASER_SPREAD;
+    const laser: Laser = {
+      x: muzzleX,
+      y: muzzleY,
+      vx: dir * LASER_SPEED * Math.cos(angle),
+      vy: LASER_SPEED * Math.sin(angle),
+      dir,
+      bounces: 0,
+    };
+
+    if (isLeft) {
+      this.leftAmmo -= 1;
+      this.leftCooldown = LASER_COOLDOWN;
+    } else {
+      this.rightAmmo -= 1;
+      this.rightCooldown = LASER_COOLDOWN;
+    }
+    this.lasers.push(laser);
+    this.emit();
   }
 
   destroy(): void {
@@ -140,22 +245,51 @@ export class PongEngine {
   }
 
   private update(dt: number): void {
+    this.regenAmmo(dt);
+    if (this.leftCooldown > 0) this.leftCooldown = Math.max(0, this.leftCooldown - dt);
+    if (this.rightCooldown > 0) this.rightCooldown = Math.max(0, this.rightCooldown - dt);
+
     // Player paddle: keyboard takes priority, otherwise follow pointer target.
-    if (this.keyUp || this.keyDown) {
-      const dir = (this.keyDown ? 1 : 0) - (this.keyUp ? 1 : 0);
-      this.leftY += dir * PLAYER_SPEED * dt;
-    } else if (this.playerTargetY != null) {
-      this.leftY = this.playerTargetY - PADDLE_H / 2;
+    // Skipped while destroyed; it respawns after a short delay.
+    if (this.leftDestroyed) {
+      this.leftRespawnIn -= dt;
+      if (this.leftRespawnIn <= 0) {
+        this.leftDestroyed = false;
+        this.announce("Your paddle is back online.");
+      }
+    } else {
+      if (this.keyUp || this.keyDown) {
+        const dir = (this.keyDown ? 1 : 0) - (this.keyUp ? 1 : 0);
+        this.leftY += dir * PLAYER_SPEED * dt;
+      } else if (this.playerTargetY != null) {
+        this.leftY = this.playerTargetY - PADDLE_H / 2;
+      }
+      this.leftY = clamp(this.leftY, 0, HEIGHT - PADDLE_H);
     }
-    this.leftY = clamp(this.leftY, 0, HEIGHT - PADDLE_H);
 
     // AI paddle: tracks the ball with a capped speed and a small dead zone.
-    const aiCenter = this.rightY + PADDLE_H / 2;
-    const diff = this.ballY - aiCenter;
-    if (Math.abs(diff) > 12) {
-      this.rightY += Math.sign(diff) * Math.min(AI_SPEED * dt, Math.abs(diff));
+    // Skipped while destroyed; it respawns after a short delay.
+    if (this.rightDestroyed) {
+      this.rightRespawnIn -= dt;
+      if (this.rightRespawnIn <= 0) {
+        this.rightDestroyed = false;
+        this.announce("Opponent paddle restored.");
+      }
+    } else {
+      const aiCenter = this.rightY + PADDLE_H / 2;
+      const diff = this.ballY - aiCenter;
+      if (Math.abs(diff) > 12) {
+        this.rightY += Math.sign(diff) * Math.min(AI_SPEED * dt, Math.abs(diff));
+      }
+      this.rightY = clamp(this.rightY, 0, HEIGHT - PADDLE_H);
+      this.updateAiFire(dt);
     }
-    this.rightY = clamp(this.rightY, 0, HEIGHT - PADDLE_H);
+
+    // Lasers.
+    this.updateLasers(dt);
+
+    // Explosion debris.
+    this.updateParticles(dt);
 
     // Ball.
     this.ballX += this.ballVX * dt;
@@ -171,8 +305,8 @@ export class PongEngine {
       this.ballVY = -Math.abs(this.ballVY);
     }
 
-    this.handlePaddle("left");
-    this.handlePaddle("right");
+    if (!this.leftDestroyed) this.handlePaddle("left");
+    if (!this.rightDestroyed) this.handlePaddle("right");
 
     // Scoring.
     if (this.ballX + BALL_RADIUS < 0) {
@@ -210,6 +344,199 @@ export class PongEngine {
         ? paddleX + PADDLE_W + BALL_RADIUS
         : paddleX - BALL_RADIUS;
     }
+  }
+
+  private regenAmmo(dt: number): void {
+    let changed = false;
+    if (this.leftAmmo < MAX_AMMO) {
+      this.leftRegen += dt;
+      if (this.leftRegen >= AMMO_REGEN) {
+        this.leftRegen -= AMMO_REGEN;
+        this.leftAmmo += 1;
+        changed = true;
+      }
+    } else {
+      this.leftRegen = 0;
+    }
+    if (this.rightAmmo < MAX_AMMO) {
+      this.rightRegen += dt;
+      if (this.rightRegen >= AMMO_REGEN) {
+        this.rightRegen -= AMMO_REGEN;
+        this.rightAmmo += 1;
+        changed = true;
+      }
+    } else {
+      this.rightRegen = 0;
+    }
+    if (changed) this.emit();
+  }
+
+  private updateAiFire(dt: number): void {
+    this.aiFireIn -= dt;
+    if (this.aiFireIn > 0) return;
+    this.aiFireIn = AI_FIRE_INTERVAL + Math.random() * AI_FIRE_INTERVAL;
+    // Beams bounce, so there's no straight line to wait for — just fire when the
+    // player is alive and we have a round. (fire() enforces ammo/cooldown/status.)
+    if (!this.leftDestroyed) this.fire("right");
+  }
+
+  private updateLasers(dt: number): void {
+    const hw = LASER_W / 2;
+    const leftPaddleX = PADDLE_MARGIN;
+    const rightPaddleX = WIDTH - PADDLE_MARGIN - PADDLE_W;
+    const next: Laser[] = [];
+
+    for (const laser of this.lasers) {
+      laser.x += laser.vx * dt;
+      laser.y += laser.vy * dt;
+
+      // Bounce off the top / bottom walls, just like the ball.
+      if (laser.y - LASER_H / 2 < 0) {
+        laser.y = LASER_H / 2;
+        laser.vy = Math.abs(laser.vy);
+        laser.bounces += 1;
+      } else if (laser.y + LASER_H / 2 > HEIGHT) {
+        laser.y = HEIGHT - LASER_H / 2;
+        laser.vy = -Math.abs(laser.vy);
+        laser.bounces += 1;
+      }
+
+      // Bounce off the left / right back walls.
+      if (laser.x - hw < 0) {
+        laser.x = hw;
+        laser.vx = Math.abs(laser.vx);
+        laser.bounces += 1;
+      } else if (laser.x + hw > WIDTH) {
+        laser.x = WIDTH - hw;
+        laser.vx = -Math.abs(laser.vx);
+        laser.bounces += 1;
+      }
+
+      // Hit the ball? Knock it away and spend the beam.
+      const bdx = this.ballX - laser.x;
+      const bdy = this.ballY - laser.y;
+      if (Math.hypot(bdx, bdy) <= BALL_RADIUS) {
+        this.bounceBallOffBeam(laser);
+        continue;
+      }
+
+      // Hit a paddle? Which one depends on the direction of travel, so a beam
+      // that ricochets off a back wall can come back and strike the firer.
+      const movingRight = laser.vx > 0;
+      const withinY = (py: number) => laser.y >= py && laser.y <= py + PADDLE_H;
+      if (
+        movingRight &&
+        !this.rightDestroyed &&
+        laser.x + hw >= rightPaddleX &&
+        laser.x - hw <= rightPaddleX + PADDLE_W &&
+        withinY(this.rightY)
+      ) {
+        this.destroyPaddle("right");
+        continue;
+      }
+      if (
+        !movingRight &&
+        !this.leftDestroyed &&
+        laser.x - hw <= leftPaddleX + PADDLE_W &&
+        laser.x + hw >= leftPaddleX &&
+        withinY(this.leftY)
+      ) {
+        this.destroyPaddle("left");
+        continue;
+      }
+
+      // Expire once a beam has ricocheted too many times.
+      if (laser.bounces <= LASER_MAX_BOUNCES) next.push(laser);
+    }
+    this.lasers = next;
+  }
+
+  private bounceBallOffBeam(laser: Laser): void {
+    // Reflect the ball about the normal pointing from the beam to the ball,
+    // then add a little of the beam's punch so the hit reads as a knock.
+    const dx = this.ballX - laser.x;
+    const dy = this.ballY - laser.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    const nx = dx / dist;
+    const ny = dy / dist;
+
+    const vDotN = this.ballVX * nx + this.ballVY * ny;
+    if (vDotN < 0) {
+      this.ballVX -= 2 * vDotN * nx;
+      this.ballVY -= 2 * vDotN * ny;
+    }
+    // Nudge it along the beam's direction and cap to the usual speed limit.
+    this.ballVX += laser.vx * 0.15;
+    this.ballVY += laser.vy * 0.15;
+    const speed = Math.hypot(this.ballVX, this.ballVY);
+    if (speed > MAX_SPEED) {
+      this.ballVX = (this.ballVX / speed) * MAX_SPEED;
+      this.ballVY = (this.ballVY / speed) * MAX_SPEED;
+    }
+
+    // Push the ball clear of the beam so it can't re-trigger next frame.
+    this.ballX = laser.x + nx * (BALL_RADIUS + 1);
+    this.ballY = laser.y + ny * (BALL_RADIUS + 1);
+
+    this.spawnParticles(laser.x, laser.y, laser.dir > 0 ? "#ffe66d" : "#ff5a5a", 10, 8, 8);
+  }
+
+  private destroyPaddle(side: "left" | "right"): void {
+    if (side === "left") {
+      this.leftDestroyed = true;
+      this.leftRespawnIn = PADDLE_RESPAWN;
+      this.spawnParticles(PADDLE_MARGIN + PADDLE_W / 2, this.leftY + PADDLE_H / 2, PLAYER_COLOR);
+      this.announce("You were hit! Your paddle was destroyed.");
+    } else {
+      this.rightDestroyed = true;
+      this.rightRespawnIn = PADDLE_RESPAWN;
+      this.spawnParticles(
+        WIDTH - PADDLE_MARGIN - PADDLE_W / 2,
+        this.rightY + PADDLE_H / 2,
+        OPPONENT_COLOR
+      );
+      this.announce("Direct hit! Opponent paddle destroyed.");
+    }
+  }
+
+  private spawnParticles(
+    cx: number,
+    cy: number,
+    color: string,
+    count = 32,
+    spreadX = PADDLE_W,
+    spreadY = PADDLE_H
+  ): void {
+    for (let i = 0; i < count; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 120 + Math.random() * 360;
+      const life = 0.5 + Math.random() * 0.6;
+      this.particles.push({
+        // Scatter across the impact area so the burst reads as a shatter / spark.
+        x: cx + (Math.random() - 0.5) * spreadX,
+        y: cy + (Math.random() - 0.5) * spreadY,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life,
+        maxLife: life,
+        size: 2 + Math.random() * 4,
+        color,
+      });
+    }
+  }
+
+  private updateParticles(dt: number): void {
+    if (this.particles.length === 0) return;
+    const next: Particle[] = [];
+    for (const p of this.particles) {
+      p.life -= dt;
+      if (p.life <= 0) continue;
+      p.vy += 520 * dt; // gravity
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      next.push(p);
+    }
+    this.particles = next;
   }
 
   private score(side: "left" | "right"): void {
@@ -266,8 +593,18 @@ export class PongEngine {
     ctx.fillText(String(this.scoreRight), WIDTH / 2 + 90, 28);
 
     // Paddles.
-    this.drawPaddle(PADDLE_MARGIN, this.leftY, "#5ee0c8");
-    this.drawPaddle(WIDTH - PADDLE_MARGIN - PADDLE_W, this.rightY, "#ff7b9c");
+    if (!this.leftDestroyed) {
+      this.drawPaddle(PADDLE_MARGIN, this.leftY, PLAYER_COLOR);
+    }
+    if (!this.rightDestroyed) {
+      this.drawPaddle(WIDTH - PADDLE_MARGIN - PADDLE_W, this.rightY, OPPONENT_COLOR);
+    }
+
+    // Lasers.
+    this.drawLasers();
+
+    // Explosion debris.
+    this.drawParticles();
 
     // Ball (the head).
     this.drawHead();
@@ -284,6 +621,40 @@ export class PongEngine {
     roundRect(ctx, x, y, PADDLE_W, PADDLE_H, 7);
     ctx.fill();
     ctx.shadowBlur = 0;
+  }
+
+  private drawLasers(): void {
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.shadowBlur = 16;
+    for (const laser of this.lasers) {
+      // Player beams are yellow, opponent beams are red.
+      const color = laser.dir > 0 ? "#ffe66d" : "#ff5a5a";
+      ctx.fillStyle = color;
+      ctx.shadowColor = color;
+      ctx.save();
+      ctx.translate(laser.x, laser.y);
+      ctx.rotate(Math.atan2(laser.vy, laser.vx));
+      ctx.fillRect(-LASER_W / 2, -LASER_H / 2, LASER_W, LASER_H);
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  private drawParticles(): void {
+    if (this.particles.length === 0) return;
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.shadowBlur = 12;
+    for (const p of this.particles) {
+      const t = p.life / p.maxLife; // 1 -> 0
+      // Glow in the paddle's color, dimming toward the end of its life.
+      ctx.globalAlpha = Math.max(0, t);
+      ctx.fillStyle = p.color;
+      ctx.shadowColor = p.color;
+      ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+    }
+    ctx.restore();
   }
 
   private drawHead(): void {
@@ -348,6 +719,8 @@ export class PongEngine {
       scoreLeft: this.scoreLeft,
       scoreRight: this.scoreRight,
       winner: this.winner,
+      playerAmmo: this.leftAmmo,
+      opponentAmmo: this.rightAmmo,
       announcement: this.announcement,
     });
   }

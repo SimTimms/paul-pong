@@ -5,13 +5,27 @@ import "./App.css";
 // Served from the public/ folder at the site root.
 const headUrl = "/head.png";
 
+const MAX_AMMO = 3;
+
 const INITIAL: GameSnapshot = {
   status: "ready",
   scoreLeft: 0,
   scoreRight: 0,
   winner: null,
+  playerAmmo: MAX_AMMO,
+  opponentAmmo: MAX_AMMO,
   announcement: "",
 };
+
+function AmmoPips({ count, className }: { count: number; className: string }) {
+  return (
+    <span className={`ammo ${className}`} aria-hidden="true">
+      {Array.from({ length: MAX_AMMO }, (_, i) => (
+        <span key={i} className={`ammo__pip${i < count ? " ammo__pip--full" : ""}`} />
+      ))}
+    </span>
+  );
+}
 
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -66,6 +80,11 @@ function App() {
           e.preventDefault();
           break;
         case " ":
+          // Space fires while playing; otherwise it starts the game.
+          if (snapshot.status === "playing") engine.firePlayerLaser();
+          else engine.start();
+          e.preventDefault();
+          break;
         case "Enter":
           if (snapshot.status === "playing") engine.togglePause();
           else engine.start();
@@ -102,6 +121,10 @@ function App() {
     engineRef.current?.setPlayerTarget(null);
   }, []);
 
+  const handlePointerDown = useCallback(() => {
+    engineRef.current?.firePlayerLaser();
+  }, []);
+
   const primaryLabel =
     snapshot.status === "playing"
       ? "Pause"
@@ -127,9 +150,15 @@ function App() {
 
       <main className="game">
         <div className="game__scoreboard" aria-hidden="true">
-          <span className="game__score game__score--player">{snapshot.scoreLeft}</span>
+          <div className="game__side">
+            <span className="game__score game__score--player">{snapshot.scoreLeft}</span>
+            <AmmoPips count={snapshot.playerAmmo} className="ammo--player" />
+          </div>
           <span className="game__score-divider">vs</span>
-          <span className="game__score game__score--cpu">{snapshot.scoreRight}</span>
+          <div className="game__side">
+            <span className="game__score game__score--cpu">{snapshot.scoreRight}</span>
+            <AmmoPips count={snapshot.opponentAmmo} className="ammo--cpu" />
+          </div>
         </div>
 
         <div className="game__stage">
@@ -138,6 +167,7 @@ function App() {
             className="game__canvas"
             onPointerMove={handlePointerMove}
             onPointerLeave={handlePointerLeave}
+            onPointerDown={handlePointerDown}
             role="img"
             aria-label={`Pong court. You ${snapshot.scoreLeft}, computer ${snapshot.scoreRight}. Status: ${snapshot.status}.`}
           />
@@ -160,7 +190,9 @@ function App() {
           <h2 className="instructions__heading">How to play</h2>
           <ul className="instructions__list">
             <li>Move your paddle with the mouse, or the Up / Down arrows (or W / S).</li>
-            <li>Press Space or Enter to start, pause, and resume.</li>
+            <li>Click the court or press Space to fire a laser — hit the pink paddle to destroy it. The opponent fires back!</li>
+            <li>You each carry 3 rounds; ammo refills one shot every 2 seconds.</li>
+            <li>Press Enter to start, pause, and resume.</li>
             <li>First to 7 points wins the match.</li>
           </ul>
         </section>
